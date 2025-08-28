@@ -2,21 +2,16 @@ name: Build & Publish (Forge)
 
 on:
   push:
-    tags:
-      - "v*" # normal release path: push a version tag like v1.2.3
+    tags: ["v*"] # e.g. v1.0.1
   workflow_dispatch:
     inputs:
       tag:
-        description: ""
+        description: "Optional tag (leave blank to auto-generate test tag)"
         required: false
         default: ""
 
 permissions:
   contents: write
-
-env:
-  # Build a tag name: user input → or the pushed tag → or an auto test tag
-  RELEASE_TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || format('test-v{0}', github.run_number) }}
 
 jobs:
   mac:
@@ -32,9 +27,23 @@ jobs:
           cache: npm
 
       - run: npm ci
-      - run: npm run make -- --platform=darwin
-      # - run: npm run make -- --platform=darwin --arch=arm64
-      # - run: npm run make -- --platform=darwin --arch=x64
+
+      # Build mac (keep both arches or just one)
+      #- run: npm run make -- --platform=darwin --arch=arm64
+      - run: npm run make -- --platform=darwin --arch=x64
+
+      # Ensure DMG + ZIP exist (fail fast if missing)
+      - name: Assert DMG & ZIP exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          DMGS=(out/make/dmg/darwin/*/*.dmg)
+          ZIPS=(out/make/zip/darwin/*/*.zip)
+          echo "Found DMGs: ${#DMGS[@]}"
+          echo "Found ZIPs: ${#ZIPS[@]}"
+          (( ${#DMGS[@]} > 0 )) || { echo "::error::No DMG found"; exit 1; }
+          (( ${#ZIPS[@]} > 0 )) || { echo "::error::No ZIP found"; exit 1; }
 
       - name: Upload mac artifacts
         uses: actions/upload-artifact@v4
@@ -57,17 +66,16 @@ jobs:
           cache: npm
 
       - run: npm ci
-      # optional 64-bit:
-      # - run: npm run make -- --platform=win32 --arch=x64
-      # optional 32-bit:
+      # Optional 64-bit:
+      #- run: npm run make -- --platform=win32 --arch=x64
+      # Optional 32-bit:
       - run: npm run make -- --platform=win32 --arch=ia32
 
       - name: Upload win artifacts
         uses: actions/upload-artifact@v4
         with:
           name: win
-          path: |
-            out/make/squirrel.windows/**/*
+          path: out/make/squirrel.windows/**/*
 
   release:
     name: Create GitHub Release with all artifacts
@@ -86,13 +94,42 @@ jobs:
           name: win
           path: dist/win
 
-      - name: Publish GitHub Release (draft for manual runs)
+      # Set RELEASE_TAG safely (manual input → pushed tag → test-v<run_number>)
+      - name: Set release tag
+        id: settag
+        shell: bash
+        run: |
+          if [ "${{ github.event.inputs.tag }}" != "" ]; then
+            echo "RELEASE_TAG=${{ github.event.inputs.tag }}" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "RELEASE_TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          else
+            echo "RELEASE_TAG=test-v${{ github.run_number }}" >> $GITHUB_ENV
+          fi
+          echo "Release tag set to: $RELEASE_TAG"
+
+      # (Optional) assert again before publishing
+      - name: Assert files present before release
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          ls -al dist/mac || true
+          ls -al dist/win || true
+          DMG_COUNT=$(ls dist/mac/**/*.dmg 2>/dev/null | wc -l | xargs)
+          ZIP_COUNT=$(ls dist/mac/**/*.zip 2>/dev/null | wc -l | xargs)
+          EXE_COUNT=$(ls dist/win/**/*Setup.exe 2>/dev/null | wc -l | xargs)
+          echo "DMGs: $DMG_COUNT, ZIPs: $ZIP_COUNT, EXEs: $EXE_COUNT"
+          [ "$DMG_COUNT" -gt 0 ] || { echo "::error::Missing DMG"; exit 1; }
+          [ "$ZIP_COUNT" -gt 0 ] || { echo "::error::Missing ZIP"; exit 1; }
+          [ "$EXE_COUNT" -gt 0 ] || { echo "::error::Missing Windows Setup.exe"; exit 1; }
+
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: Release ${{ env.RELEASE_TAG }}
           tag_name: ${{ env.RELEASE_TAG }}
-          # If this run was triggered via workflow_dispatch (manual), keep it a draft.
-          draft: ${{ github.event_name == 'workflow_dispatch' }}
+          draft: ${{ github.event_name == 'workflow_dispatch' }} # draft for manual runs
           prerelease: false
           files: |
             dist/mac/**/*
